@@ -1,8 +1,11 @@
 package rso.dfs.server;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -93,8 +96,13 @@ public class ServerHandler implements Service.Iface {
 	private Lock awaitingSlavesLock = new ReentrantLock();
 	private Map<Integer, List<Condition>> awaitingSlaves = new HashMap<Integer, List<Condition>>();
 	private Long syncCounter = 1L;
+	
+	/**
+	 * Core status checking services.
+	 */
 	private ServerStatusCheckerService serverCheckerService = null;
-	private MasterChecker masterCheckerService= null;
+	private MasterChecker masterCheckerService = null;
+	
 	/**
 	 * Contains statuses which files where used;
 	 * key -> fileId;
@@ -115,7 +123,7 @@ public class ServerHandler implements Service.Iface {
 		if(me.getRole() == ServerRole.MASTER)
 		{
 			log.debug("Starting ServerStatusCheckerService form Master");
-			serverCheckerService= new ServerStatusCheckerService(this);
+			serverCheckerService = new ServerStatusCheckerService(this);
 			serverCheckerService.runService();
 		}
 	}
@@ -165,9 +173,13 @@ public class ServerHandler implements Service.Iface {
 
 	@Override
 	public SystemStatus getStatus() throws TException {
+		log.debug("Got getStatus request");
 		SystemStatus ss = new SystemStatus();
 		ss.setFilesNumber(repository.getAllFiles().size());		
 		Server master = repository.getMasterServer();
+		
+		log.debug("Master server is " + master);
+		
 		ss.addToServersStatuses(
 				new ServerStatus(
 						ServerType.Master,master.getFilesNumber(), 
@@ -212,6 +224,7 @@ public class ServerHandler implements Service.Iface {
 		{
 			log.info("Server not found in repository");
 		}
+			 		 	
 		
 	 	List<Server> shadows = null;
 	 	try
@@ -231,7 +244,12 @@ public class ServerHandler implements Service.Iface {
 			server.setMemory(DFSProperties.getProperties().getStorageServerMemory()); 
 			server.setRole(ServerRole.SLAVE);
 			server.setLastConnection(new DateTime());
-			repository.saveServer(server);
+			try {
+				log.debug("Saving the server in the repository.");
+				repository.saveServer(server);
+			} catch (Exception e) {
+				log.error("Saving the server in the repository failed: " + e.getMessage() + ".");
+			}
 		}
 		else
 		{
@@ -243,12 +261,8 @@ public class ServerHandler implements Service.Iface {
 		}
 		
 
-	 	if(shadows == null || shadows.size() < DFSProperties.getProperties().getShadowCount()) 
-	 	{
-	 		makeShadow(server.getIp());
-	 	}
 
-	 	
+
 		List<Integer> ids = req.getFileIds();
 		List<Integer> idsToRemove = new LinkedList<>();
 		for (int fileId : ids) {
@@ -270,6 +284,7 @@ public class ServerHandler implements Service.Iface {
 				fileOnServer.setFileId(fileId);
 				fileOnServer.setServerId(server.getId());
 				fileOnServer.setPriority(0l);
+				log.debug("registerSlave: registering fileid " + fileId);
 				repository.saveFileOnServer(fileOnServer);
 				idsToRemove.add(fileId);
 			}
@@ -280,7 +295,8 @@ public class ServerHandler implements Service.Iface {
 		{
 			log.debug(ids.size() + " files to remove from server");
 		}
-		//edge case - not visible from master, visible for client - remove file slave will disconnect client..
+		
+		//edge case - not visible from master, visible for client - removeFileSlave will disconnect the client...
 		try (DFSClosingClient cclient = new DFSClosingClient(req.getSlaveIP(), DFSProperties.getProperties().getStorageServerPort())) {
 			Client client = cclient.getClient();
 			for (Integer fileId : ids) {
@@ -288,6 +304,42 @@ public class ServerHandler implements Service.Iface {
 			}
 		} catch (Exception e) {
 			e.printStackTrace();
+		}
+		
+		//Now that we have a clean storage unit, let's fill it with files with insufficient replication factor.
+		List<File> allFiles = repository.getAllFiles();
+		for (File f: allFiles) {
+			List<Server> slavesWithF = repository.getSlavesByFile(f); 
+			if (slavesWithF.size() < DFSProperties.getProperties().getReplicationFactor() && !slavesWithF.contains(server)) {
+		
+				//Replicate!
+				//1. Pick a slave,
+				//2. Take a copy.
+				final File replFile = f;
+				final NewSlaveRequest r = req;
+				
+				Thread thread = new Thread(new Runnable() {
+					File f = replFile;
+					NewSlaveRequest req = r;
+					
+					public void run() {
+						List<Server> slaves = repository.getSlavesByFile(f);
+						Server mainRepl = slaves.get(0);
+						repository.saveFileOnServer(new FileOnServer(f.getId(), repository.getServerByIp(req.getSlaveIP()).getId(), -(repository.getFileOnServer(slaves.get(slaves.size() - 1).getId(), f.getId()).getPriority() + 1)));
+						try (DFSClosingClient cclient = new DFSClosingClient(req.getSlaveIP(), DFSProperties.getProperties().getStorageServerPort())) {
+							Client client = cclient.getClient();
+							client.replicate(f.getId(), mainRepl.getIp(), f.getSize());
+						} catch (Exception e) {
+							//Lost connection to the slave... Unfortunate?
+							//Not sure if return here is the correct way, but
+							//walking around loops is even less productive.
+							repository.deleteFileOnServer(new FileOnServer(f.getId(), repository.getServerByIp(req.getSlaveIP()).getId(), 0));
+						}
+					}
+				});
+				thread.start();
+				
+			}
 		}
 
 		debugSleep();
@@ -325,7 +377,7 @@ public class ServerHandler implements Service.Iface {
 				Client client = cclient.getClient();
 				client.updateCoreStatus(coreStatus);
 			} catch (Exception e) {
-				e.printStackTrace();
+				log.debug("Failed to update corestatus of shadow " + shadow.getIp());
 			}
 		}
 		
@@ -337,7 +389,7 @@ public class ServerHandler implements Service.Iface {
 				Client client = cclient.getClient();
 				client.updateCoreStatus(coreStatus);
 			} catch (Exception e) {
-				e.printStackTrace();
+				log.debug("Failed to update corestatus of slave " + slave.getIp());
 			}
 		}
 		
@@ -345,6 +397,7 @@ public class ServerHandler implements Service.Iface {
 
 	@Override
 	public void becomeShadow(CoreStatus status) throws TException {
+		log.debug(me.getIp() + ": becoming shadow...");
 		me.setRole(ServerRole.SHADOW);
 		masterCheckerService = new MasterChecker(this);
 		masterCheckerService.runService();
@@ -420,9 +473,31 @@ public class ServerHandler implements Service.Iface {
 						
 						offset += filePart.getData().length;
 					}
+				} catch (TTransportException tte) {
+					try (DFSClosingClient ccClient1 = new DFSClosingClient(coreStatus.getMasterAddress(), DFSProperties.getProperties().getNamingServerPort())) {
+						log.info(me.getIp() + ": Replication failed from main replication node " + slaveIP + ".");
+						Service.Client serviceClient = ccClient1.getClient();
+						slaveIP = serviceClient.replicationFailure(fileID, slaveIP);
+						if (slaveIP == "0.0.0.0") {
+							storageHandler.deleteFile(fileID);
+							return;
+						}
+					} catch (TTransportException tte1) {
+						log.error("Replication failed: could not connect to master server!");
+						return;
+					} catch (TException te1) {
+						log.error("Replication failed: replicationFailure called has thrown an exception (shouldn't happen!).");
+						return;
+					} catch (Exception e1) {
+						log.error("Replication failed: unidentified exception has been thrown.");
+						e1.printStackTrace();
+						return;
+					}
 				} catch (Exception e) {
 					log.error(me.getIp() + ": Caught an unidentified exception: " + e.getMessage());
 					e.printStackTrace();
+					storageHandler.deleteFile(fileID);
+					return;
 				}			
 	
 				log.debug(me.getIp() + ": Updating master database.");
@@ -455,7 +530,36 @@ public class ServerHandler implements Service.Iface {
 		 * 	  with an updated address.
 		 */
 		
-		return "";
+		File failedFile = new File();
+		failedFile.setId(fileID);
+		int timeoutCounter = 0;
+		Server newMainRepl;
+		while(true) {
+			try {
+				do {
+					newMainRepl = null;
+					Thread.sleep(1000);
+					List<Server> serverList = repository.getSlavesByFile(failedFile);
+					List<FileOnServer> fosList = new ArrayList<FileOnServer>();
+					for (Server s: serverList) {
+						if (repository.getFileOnServer(s.getId(), fileID).getPriority() < 0) {
+							newMainRepl = s;
+							break;
+						}
+					}
+					timeoutCounter++;
+				} while (newMainRepl == null && timeoutCounter < 5);
+				break;
+			} catch (InterruptedException ie) {}
+		}
+		
+		if (newMainRepl != null) return newMainRepl.getIp(); 
+		
+		FileOnServer fos = new FileOnServer();
+		fos.setFileId(fileID);
+		fos.setServerId(repository.getServerByIp(slaveIP).getId());
+		repository.deleteFileOnServer(fos);
+		return "0.0.0.0";
 	}
 
 	@Override
@@ -506,9 +610,23 @@ public class ServerHandler implements Service.Iface {
 	}
 
 	@Override
-	public GetFileParams getFileFailure(String filepath) throws TException {
-		// TODO Auto-generated method stub
-		return null;
+	public GetFileParams getFileFailure(GetFileParams gfp) throws TException {
+		// redirect the client to another slave
+		
+		File f = new File(); f.setId(gfp.getFileId());
+		List<Server> slaves = repository.getSlavesByFile(f);
+		List<FileOnServer> slavesWithFile = new ArrayList<FileOnServer>();
+		for (Server s: slaves) {
+			slavesWithFile.add(repository.getFileOnServer(s.getId(), gfp.getFileId()));
+		}
+		
+		int ind = (slavesWithFile.lastIndexOf(new FileOnServer(gfp.getFileId(), repository.getServerByIp(gfp.getSlaveIp()).getId(), 0)) + 1);
+		if (ind >= slavesWithFile.size())
+			gfp.setSlaveIp("0.0.0.0");
+		else
+			gfp.setSlaveIp(repository.getServerById(slavesWithFile.get(ind).getServerId()).getIp());
+		
+		return gfp;
 	}
 
 	/**
@@ -569,15 +687,15 @@ public class ServerHandler implements Service.Iface {
 				putFileParams.setFileId(fileId);
 				putFileParams.setSize(size);
 				
-				try (DFSTSocket dfstSocket = new DFSTSocket(mainRepl.getIp(), 
+				try (DFSClosingClient dfscClient = new DFSClosingClient(mainRepl.getIp(), 
 						DFSProperties.getProperties().getStorageServerPort())) {
-					dfstSocket.open();
-					TProtocol protocol = new TBinaryProtocol(dfstSocket);
-					Service.Client serviceClient = new Service.Client(protocol);
+					Service.Client serviceClient = dfscClient.getClient();
 					serviceClient.sendFileToSlaveRequest(fileId);
 					succeeded = true;
 				} catch (TException te) {
 					// Cycle through and select another primary replication node
+				} catch (Exception e) {
+					// Same.
 				}
 			} catch (org.springframework.dao.DuplicateKeyException e) {
 				log.error("File exists!");
@@ -585,7 +703,7 @@ public class ServerHandler implements Service.Iface {
 			}
 		}
 	
-		log.debug(me.getIp() + ": Remaining number of replicas: " + (keys.size() - 1));
+		log.debug(me.getIp() + ": Remaining number of replicas: " + (replDegree - 1));
 		
 		
 		// TODO: what to do when there is not enough slaves to replicate
@@ -593,24 +711,23 @@ public class ServerHandler implements Service.Iface {
 			Server secRepl = (Server) i.next();
 			if (secRepl.getRole() == ServerRole.DOWN) continue;
 			
-			try (DFSTSocket dfstSocket = new DFSTSocket(secRepl.getIp(), 
+			try (DFSClosingClient dfscClient = new DFSClosingClient(secRepl.getIp(), 
 					DFSProperties.getProperties().getStorageServerPort())) {
-				dfstSocket.open();
-				TProtocol protocol = new TBinaryProtocol(dfstSocket);
-				Service.Client serviceClient = new Service.Client(protocol);
+				Service.Client serviceClient = dfscClient.getClient();
 				log.debug(me.getIp() + ": Replicating to " + secRepl.getIp());
 				serviceClient.replicate(putFileParams.getFileId(), mainReplIP, size);
-				repository.saveFileOnServer(new FileOnServer(putFileParams.getFileId(), secRepl.getId(), -(totalReplDegree - replDegree)));
+				repository.saveFileOnServer(new FileOnServer(putFileParams.getFileId(), secRepl.getId(), -(totalReplDegree - replDegree + 1)));
 			} catch (Exception e) {
 				log.error(me.getIp() + ": Replication failed on slave #" + secRepl.getId() + ": " + e.getMessage());
 				replDegree++;
-				try (DFSTSocket dfstSocket = new DFSTSocket(secRepl.getIp(), 
+				try (DFSClosingClient dfscClient = new DFSClosingClient(secRepl.getIp(), 
 						DFSProperties.getProperties().getStorageServerPort())) {
-					dfstSocket.open();
-					TProtocol protocol = new TBinaryProtocol(dfstSocket);
-					Service.Client serviceClient = new Service.Client(protocol);
+					Service.Client serviceClient = dfscClient.getClient();
 					serviceClient.pingServer();
 				} catch (TException te) {
+					secRepl.setRole(ServerRole.DOWN);
+					repository.updateServer(secRepl);
+				} catch (Exception e1) {
 					secRepl.setRole(ServerRole.DOWN);
 					repository.updateServer(secRepl);
 				}
@@ -645,11 +762,9 @@ public class ServerHandler implements Service.Iface {
 		 * of a file (nor will client's performPut), but realistically, we gotta start there.
 		 */
 		
-		try (DFSTSocket dfstSocket = new DFSTSocket(pfp.getSlaveIp(), 
+		try (DFSClosingClient dfscClient = new DFSClosingClient(pfp.getSlaveIp(), 
 				DFSProperties.getProperties().getStorageServerPort())) {
-			dfstSocket.open();
-			TProtocol protocol = new TBinaryProtocol(dfstSocket);
-			Service.Client serviceClient = new Service.Client(protocol);
+			Service.Client serviceClient = dfscClient.getClient();
 			serviceClient.pingServer();
 		} catch (Exception e) {
 
@@ -698,18 +813,14 @@ public class ServerHandler implements Service.Iface {
 				Iterator i = slavesWithoutFile.iterator();
 				while (i.hasNext()) {
 					Server nextReplSlave = (Server)i.next();
-					try (DFSTSocket dfstSocket = new DFSTSocket(nextReplSlave.getIp(), 
+					try (DFSClosingClient dfscClient = new DFSClosingClient(nextReplSlave.getIp(), 
 							DFSProperties.getProperties().getStorageServerPort())) {
-						dfstSocket.open();
-						TProtocol protocol = new TBinaryProtocol(dfstSocket);
-						Service.Client serviceClient = new Service.Client(protocol);
-						serviceClient.replicate(pfp.getFileId(), nextReplSlave.getIp(), pfp.getSize());
-						repository.saveFileOnServer(new FileOnServer(pfp.getFileId(), nextReplSlave.getId(), -1));
-						
-						pfp.setSlaveIp(nextReplSlave.getIp());
+						Service.Client serviceClient = dfscClient.getClient();
+						serviceClient.replicate(pfp.getFileId(), pfp.getSlaveIp(), pfp.getSize());
+						repository.saveFileOnServer(new FileOnServer(pfp.getFileId(), nextReplSlave.getId(), -(slavesWithFile.size() + 1)));
 						return pfp;
-					} catch (TException te) {
-						// TODO: handle
+					} catch (Exception e1) {
+						//Try again.
 					}
 				}
 			} catch (TException te) {
@@ -721,7 +832,27 @@ public class ServerHandler implements Service.Iface {
 		}
 
 		// Got a response
-		return null;
+		File tmp = new File();
+		tmp.setId(pfp.getFileId());
+		List<Server> slavesWithFile = repository.getSlavesByFile(tmp);
+		List<FileOnServer> fosByPrio = new ArrayList<FileOnServer>();
+		FileOnServer newMainRepl = repository.getFileOnServer(slavesWithFile.get(0).getId(), pfp.getFileId());
+		for (Server s: slavesWithFile) {
+			FileOnServer x = repository.getFileOnServer(s.getId(), pfp.getFileId()); 
+			if (x.getPriority() > newMainRepl.getPriority() && x.getPriority() != -1)
+				newMainRepl = x;
+		}
+		long tmpPrio = newMainRepl.getPriority();
+		newMainRepl.setPriority(-1L);
+		repository.updateFileOnServer(newMainRepl);
+		repository.updateFileOnServer(new FileOnServer(pfp.getFileId(), repository.getServerByIp(pfp.getSlaveIp()).getId(), tmpPrio));
+		for (Server s: slavesWithFile) {
+			if (s.getId() == newMainRepl.getServerId()) {
+				pfp.setSlaveIp(s.getIp());
+				break;
+			}
+		}
+		return pfp;
 	}
 
 	/**
@@ -819,6 +950,25 @@ public class ServerHandler implements Service.Iface {
 	 */
 	@Override
 	public FilePartDescription sendFilePartToSlave(FilePart filePart) throws TException {
+		log.debug("sFPTS: filePart.getData().length: " + filePart.getData().length);
+		if (filePart.getData().length == 0) {
+			try (DFSClosingClient dfsclient = new DFSClosingClient(coreStatus.getMasterAddress(), DFSProperties.getProperties().getNamingServerPort())) {
+				log.info("sendFilePartToSlave: upload completed. Updating master database.");
+				Service.Client client = dfsclient.getClient();
+				client.fileUploadSuccess(filePart.getFileId(), me.getIp());
+				return new FilePartDescription(filePart.getFileId(), filePart.getOffset());
+			} catch (TException te) {
+				log.error("sendFilePartToSlave: Critical error: could not modify the state of the uploaded file.");
+				throw new TException("Uploading file failed: could not modify the state of the uploaded file in the rmeote repository.");
+			} catch (Exception e) {
+				log.error("sendFilePartToSlave: Critical error: lost connection to master.");
+				throw new TException("Uploading file failed: storage server lost connection with the naming server.");
+			}
+		}
+		
+		if (filePart.getOffset() > storageHandler.getFileSize(filePart.getFileId()))
+			return new FilePartDescription(filePart.getFileId(), storageHandler.getFileSize(filePart.getFileId()));
+		
 		log.debug(me.getIp() + ": sendFilePartToSlave: acquiring lock (#" + syncCounter++ + ")");
 		try {
 			// TODO: check if the filePart is from the expected client
@@ -931,7 +1081,7 @@ public class ServerHandler implements Service.Iface {
 	@Override
 	public void fileUploadSuccess(int fileID, String slaveIP) throws TException {
 		
-		log.debug("fileUploadSuccess: fileID:" + fileID + ";slaveIP: " + slaveIP ); 
+		log.debug("fileUploadSuccess: fileID:" + fileID + ";slaveIP: " + slaveIP); 
 		
 		rso.dfs.model.File f = repository.getFileById(fileID);
 
@@ -943,6 +1093,7 @@ public class ServerHandler implements Service.Iface {
 			return;
 		}
 		FileOnServer fos = repository.getFileOnServer(s.getId(), fileID);
+		log.debug("fileUploadSuccess: fos.sid: " + fos.getServerId() + ", fos.fid: " + fos.getFileId() + ", fos.priority: " + Math.abs(fos.getPriority()));
 		fos.setPriority(Math.abs(fos.getPriority()));
 		repository.updateFileOnServer(fos); 
 		repository.updateFile(f);
@@ -1019,10 +1170,15 @@ public class ServerHandler implements Service.Iface {
 			updateCoreStatus(coreStatus);
 			
 			log.debug("I, humble slave with IP address " + me.getIp() + ", registered to master at " + masterIP);
-		} catch (TTransportException e1) {
-			e1.printStackTrace();
-		} catch (Exception e1) {
-			e1.printStackTrace();
+		} catch (TTransportException tte) {
+			log.error("Unable to connect to the requested server. (" + tte.getMessage() + ")");
+			System.exit(1);
+		} catch (TException te) {
+			log.error("Caught an exception from the remote end during slave registration: " + te.getMessage());
+			System.exit(1);
+		} catch (Exception e) {
+			log.error("Unable to connect to the requested server. (" + e.getMessage() + ")");
+			System.exit(1);
 		}
 		debugSleep();
 	}
@@ -1039,9 +1195,12 @@ public class ServerHandler implements Service.Iface {
 	
 	public void makeShadow(String slaveIpAddress){
 		final String slaveIp = slaveIpAddress;
-		//FOR NOW IT'S RUNNED FROM CHECKER THREAD
-		/*Thread thread = new Thread(new Runnable() {
-			public void run(){*/
+		Server serverByIp = repository.getServerByIp(slaveIpAddress);
+		serverByIp.setRole(ServerRole.SHADOW);
+		repository.updateServer(serverByIp);
+		
+		Thread thread = new Thread(new Runnable() {
+			public void run(){
 				log.info("Order " + slaveIp + " to become Shadow");
 				// make dump
 				String dbPass = DFSProperties.getProperties().getDbpassword();
@@ -1052,11 +1211,16 @@ public class ServerHandler implements Service.Iface {
 				slaveDao.cleanDB();
 				
 				String cmd = "PGPASSWORD=" + dbPass + " pg_dump -h 127.0.0.1 -U " + dbUser + 
-						" | PGPASSWORD=" + dbPass + " psql -h " + slaveIp + " -d " + dbName + " -U " + dbUser; 
-				try (DFSTSocket dfstSocket = new DFSTSocket(slaveIp, DFSProperties.getProperties().getStorageServerPort())) {
+						" | PGPASSWORD=" + dbPass + " psql -h " + slaveIp + " -d " + dbName + " -U " + dbUser;
+				try (DFSClosingClient dfscClient = new DFSClosingClient(slaveIp, DFSProperties.getProperties().getStorageServerPort())) {
 					Runtime.getRuntime().exec(new String[]{"sh", "-c", cmd}).waitFor();
-					log.debug("Database dumped");
+					log.debug("... Database dumped.");
 					DFSRepositoryImpl.dbSemaphore.acquire(DFSRepositoryImpl.MAX_THREADS);
+					
+					String seqnames[] = {"servers_id_seq", "files_id_seq", "log_id_sec"};
+					for(String seq: seqnames) {
+						slaveDao.setSeqVals(seq, repository.getDAO().fetchSeqVals(seq));
+					}
 					
 					List<Query> queries = slaveDao.fetchAllQueries();
 					Long actualVersion = queries.get(queries.size()-1).getId();
@@ -1065,22 +1229,41 @@ public class ServerHandler implements Service.Iface {
 						slaveDao.executeQuery(sql.getSql());
 					}
 					Server slave = repository.getServerByIp(slaveIp);
+					
 					repository.addShadow(slave);
-					dfstSocket.open();
-					TProtocol protocol = new TBinaryProtocol(dfstSocket);
-					Service.Client serviceClient = new Service.Client(protocol);
+					
+					Service.Client serviceClient = dfscClient.getClient();
+					
+					log.debug("Executing becomeShadow on " + slaveIp + ".");
 					serviceClient.becomeShadow(coreStatus);
 					
+					log.debug("Performing system-wide core status update.");
 					massiveUpdateCoreStatus();
+					
+				} catch (TTransportException tte) {
+					log.error("Unable to connect to the requested storage server. (" + tte.getMessage() + ")");
+					DFSRepositoryImpl.dbSemaphore.release(DFSRepositoryImpl.MAX_THREADS);
+					return;
+				} catch (TException te) {
+					log.error("Caught an exception from the remote end during shadow conversion: " + te.getMessage());
+					DFSRepositoryImpl.dbSemaphore.release(DFSRepositoryImpl.MAX_THREADS);
+					return;
+				} catch (IOException ioe) {
+					log.error("Unable to dump the database. (" + ioe.getMessage() + ")");
+					DFSRepositoryImpl.dbSemaphore.release(DFSRepositoryImpl.MAX_THREADS);
+					return;
+				} catch (InterruptedException ie) {
+					//TODO: idk
 				} catch (Exception e) {
-					log.error(e.getMessage());
-					e.printStackTrace();
+					log.error("Transient error occured on the socket: " + e.getMessage());
+					DFSRepositoryImpl.dbSemaphore.release(DFSRepositoryImpl.MAX_THREADS);
+					return;
 				} finally {
 					DFSRepositoryImpl.dbSemaphore.release(DFSRepositoryImpl.MAX_THREADS);
 				}
-				/*}
+			}
 		});
-		thread.start();*/
+		thread.start();
 	}
 	
 	void debugSleep()
@@ -1101,20 +1284,24 @@ public class ServerHandler implements Service.Iface {
 	}
 
 	public void becomeMaster() {
+		log.debug("Me, " + me + ", becoming a master.");
 		this.me.setRole(ServerRole.MASTER);
 		
 		masterCheckerService.stopService();
 		
+		log.debug(me.getIp() + ", new master, getting a repo...");
 		//first, I'll get myself a repo (maybe inform first?)
 		BlockingQueue<DFSTask> blockingQueue = new LinkedBlockingQueue<>();
 		repository = new DFSRepositoryImpl(me, blockingQueue);
 		Server masterServer = repository.getMasterServer();
 		masterServer.setRole(ServerRole.DOWN);
 		repository.updateServer(masterServer);
+		log.debug(me.getIp() + ", new master, got a repo.");
 		
 		repository.updateServer(me);
 		storageHandler = new EmptyStorageHandler(); //just not to do serving any more
 
+		log.debug(me.getIp() + ", new master, updating core status of followers..");
 		try {
 			DFSRepositoryImpl.dbSemaphore.acquire(DFSRepositoryImpl.MAX_THREADS);
 		
@@ -1126,14 +1313,14 @@ public class ServerHandler implements Service.Iface {
 		
 		List<Server> shadows = repository.getShadows();
 		
-		
+		log.debug(me.getIp() + ", new master, will tell shadows what to do.");
 		for(Server shadow: shadows)
 		{
 			String shadowIP = shadow.getIp();
 			
 			DFSModelDAOImpl shadowDAO = new DFSModelDAOImpl(new DFSDataSource(shadowIP));
 			
-			try (DFSTSocket dfstSocket = new DFSTSocket(shadowIP, DFSProperties.getProperties().getStorageServerPort())) {
+			try (DFSClosingClient dfscClient = new DFSClosingClient(shadowIP, DFSProperties.getProperties().getStorageServerPort())) {
 							
 				List<Query> queries = shadowDAO.fetchAllQueries();
 				Long actualVersion = queries.get(queries.size()-1).getId();
@@ -1147,7 +1334,7 @@ public class ServerHandler implements Service.Iface {
 				e.printStackTrace();
 			}
 		}
-		
+		log.debug(me.getIp() + ", new master, told shadows what to do.");
 
 		} catch (InterruptedException e1) {
 			e1.printStackTrace();
@@ -1159,6 +1346,7 @@ public class ServerHandler implements Service.Iface {
 		
 		serverCheckerService = new ServerStatusCheckerService(this);
 		serverCheckerService.runService();
+		log.debug(me.getIp() + ", new master, rund followers checking service.");
 	}
 	
 }

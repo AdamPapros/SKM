@@ -63,5 +63,9 @@ public interface DFSRepository {
 	public void addShadow(Server shadow);
 
 	public FileOnServer getFileOnServer(Long long1, Integer fileId);
+
+	public Server getServerById(Long serverId);
+	
+	public DFSModelDAO getDAO();
 	
 }

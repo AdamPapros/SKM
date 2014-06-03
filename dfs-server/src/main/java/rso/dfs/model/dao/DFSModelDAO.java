@@ -37,6 +37,11 @@ public interface DFSModelDAO {
 
 	public List<Server> fetchServersByFileId(Integer fileId);
 
+	public Integer fetchSeqVals(String seq_name);
+	
+	public void setSeqVals(String seq_name, Integer value);
+
+	
 	/**
 	 * Saves file.
 	 * 
@@ -83,6 +88,8 @@ public interface DFSModelDAO {
 	public void executeQuery(String sql);
 
 	public FileOnServer fetchFos(Long serverId, Integer fileId);
+
+	public Server fetchServerById(Long serverId);
 
 
 }

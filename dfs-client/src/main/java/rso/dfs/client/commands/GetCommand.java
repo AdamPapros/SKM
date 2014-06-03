@@ -44,6 +44,7 @@ public class GetCommand extends ClientActionBase {
 			GetHandler handler = new GetHandler(masterIP);
 			try {
 				handler.performGet(filePathSrc, filePathDst);
+				break;
 			} catch (SlaveNotAlive slaveNotAlive) {
 				// increment counter
 				++counter;
@@ -63,7 +64,7 @@ public class GetCommand extends ClientActionBase {
 				// this place is probably the best to catch exceptions'n'shit
 				
 				Log.error(e);
-				e.printStackTrace();
+				//e.printStackTrace();
 				return;
 			}
 

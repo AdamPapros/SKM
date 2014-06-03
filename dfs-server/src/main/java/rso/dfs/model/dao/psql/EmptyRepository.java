@@ -6,6 +6,7 @@ import rso.dfs.model.File;
 import rso.dfs.model.FileOnServer;
 import rso.dfs.model.Query;
 import rso.dfs.model.Server;
+import rso.dfs.model.dao.DFSModelDAO;
 import rso.dfs.model.dao.DFSRepository;
 
 /**
@@ -140,6 +141,16 @@ public class EmptyRepository implements DFSRepository {
 
 	@Override
 	public FileOnServer getFileOnServer(Long long1, Integer fileId) {
+		throw new IllegalStateException(message);
+	}
+
+	@Override
+	public Server getServerById(Long serverId) {
+		throw new IllegalStateException(message);
+	}
+	
+	@Override
+	public DFSModelDAO getDAO () {
 		throw new IllegalStateException(message);
 	}
 
